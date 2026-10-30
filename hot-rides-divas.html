@@ -3509,6 +3509,17 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       setUpgrades(u) {
         Object.assign(upg, u);
       },
+      /** Apply an impulse in world XZ (N·s). Used by car-car crashes. */
+      applyWorldImpulse(jx, jz, torqueYaw) {
+        const st = state;
+        const c = Math.cos(st.yaw), s = Math.sin(st.yaw);
+        // world → body
+        st.vx += (jx * c - jz * s) / mass;
+        st.vz += (jx * s + jz * c) / mass;
+        if (torqueYaw) st.yawRate += torqueYaw / inertiaYaw;
+        st.speed = Math.hypot(st.vx, st.vz);
+      },
+      getMass() { return mass; },
       reset(x, y, z, yaw) {
         state.x = x; state.y = y; state.z = z; state.yaw = yaw || 0;
         state.vx = state.vy = state.vz = 0; state.yawRate = 0;
@@ -3944,7 +3955,7 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
     if (!global.StreetPhysics || !StreetPhysics.createCarPhysics) {
       throw new Error('StreetPhysics required before VehicleController');
     }
-    const physics = StreetPhysics.createCarPhysics({ upgrades: opts.upgrades });
+    const physics = StreetPhysics.createCarPhysics({ upgrades: opts.upgrades, mass: opts.mass, inertiaYaw: opts.inertiaYaw });
     const mapEnv = Object.assign({ ambientC: 20, wet: false }, opts.mapEnv || {});
     if (opts.mapEnv && opts.mapEnv.volcano) mapEnv.ambientC = 50;
     if (opts.mapEnv && opts.mapEnv.wet) mapEnv.wet = true;
@@ -4117,6 +4128,12 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
           yaw: lerp(prevPose.yaw, currPose.yaw, alpha)
         };
       },
+      /** After external collision push — snap render buffer to physics state. */
+      resyncRenderPose() {
+        snapshotPose(prevPose);
+        snapshotPose(currPose);
+        alpha = 1;
+      },
 
       getTireTemps() {
         return (physics.state.tire_temperature || [20, 20, 20, 20]).slice();
@@ -4220,6 +4237,10 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
     let wp = opts.startWp || 0;
     const lookAhead = opts.lookAhead || 2;
     const skill = clamp(opts.skill != null ? opts.skill : 0.85, 0.4, 1);
+    // Optional: () => [{x,z,yaw,speed}, ...] so AI brakes/steers away from pack mates
+    const getNeighbors = typeof opts.getNeighbors === 'function' ? opts.getNeighbors : null;
+    // Prefer a stable lateral bias so packed AI do not all hug the same line
+    const laneBias = opts.laneBias != null ? opts.laneBias : 0;
 
     function nearestWp(x, z) {
       let best = 0, bd = 1e15;
@@ -4231,6 +4252,12 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       return best;
     }
 
+    function retargetNear() {
+      const st = controller.state;
+      wp = nearestWp(st.x, st.z);
+      return wp;
+    }
+
     function tick(frameDt) {
       const st = controller.state;
       // Snap wp forward to nearest sample (never rewind unless far off-track)
@@ -4238,7 +4265,13 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       let ahead = (nearIdx - wp + nWp) % nWp;
       if (ahead > 0 && ahead < nWp * 0.45) wp = nearIdx;
       const ndx0 = waypoints[nearIdx].x - st.x, ndz0 = waypoints[nearIdx].z - st.z;
-      if (ndx0 * ndx0 + ndz0 * ndz0 > 28 * 28 && ahead > nWp * 0.5) wp = nearIdx;
+      const dNear2 = ndx0 * ndx0 + ndz0 * ndz0;
+      // Far from claimed wp or spun off the ribbon → snap to nearest (stops infield cuts)
+      const tw = waypoints[wp % nWp];
+      const dWp2 = (tw.x - st.x) * (tw.x - st.x) + (tw.z - st.z) * (tw.z - st.z);
+      if (dNear2 > 28 * 28 && ahead > nWp * 0.5) wp = nearIdx;
+      else if (dWp2 > 55 * 55 && dNear2 < dWp2 * 0.55) wp = nearIdx;
+      else if (ahead > nWp * 0.55) wp = nearIdx;
 
       // Advance when past current waypoint
       const near = waypoints[wp % nWp];
@@ -4262,12 +4295,12 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       const nx = -ndz / nLen, nz = ndx / nLen; // left normal
       const lat = (st.x - na.x) * nx + (st.z - na.z) * nz;
 
-      let desiredYaw = tYaw - clamp(lat * 0.055, -0.55, 0.55);
+      let desiredYaw = tYaw - clamp((lat - laneBias) * 0.055, -0.55, 0.55);
       let err = desiredYaw - st.yaw;
       while (err > Math.PI) err -= Math.PI * 2;
       while (err < -Math.PI) err += Math.PI * 2;
       const slip = st.vx || 0;
-      let steer = clamp(err * 1.4 - slip * 0.12 - lat * 0.04, -1, 1) * skill;
+      let steer = clamp(err * 1.4 - slip * 0.12 - (lat - laneBias) * 0.04, -1, 1) * skill;
 
       const spd = st.speed || 0;
       if (spd < 5) steer *= 0.4 + 0.12 * spd;
@@ -4287,14 +4320,58 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
         handbrake = 0.12;
         throttle = 0.45;
       }
+
+      // Pack avoidance: steer clear of neighbors; only brake when truly closing in-lane.
+      // Keep soft at low speed so the start grid can launch instead of mutual-braking.
+      if (getNeighbors && !reversed) {
+        const yawC = Math.cos(st.yaw), yawS = Math.sin(st.yaw);
+        let neigh = null;
+        try { neigh = getNeighbors(); } catch (_) { neigh = null; }
+        if (neigh && neigh.length) {
+          const launch = spd < 14;
+          for (let i = 0; i < neigh.length; i++) {
+            const n = neigh[i];
+            if (!n) continue;
+            const ddx = n.x - st.x, ddz = n.z - st.z;
+            const dist = Math.hypot(ddx, ddz);
+            if (!(dist > 0.05) || dist > 16) continue;
+            const along = ddx * yawS + ddz * yawC;
+            const latN = ddx * yawC - ddz * yawS;
+            const closing = spd - (n.speed || 0);
+            // Always peel laterally when close — prevents pack orbit / mutual aim-in
+            if (dist < 7.5 && Math.abs(along) < 8.0) {
+              const side = (latN >= 0 ? -1 : 1);
+              const latMag = Math.max(0.15, Math.abs(latN));
+              const away = side * clamp(1.15 - latMag / 3.2, 0.25, 1.15) * clamp(1.1 - dist / 7.5, 0.35, 1);
+              steer += away * (launch ? 0.85 : 1.0);
+            }
+            if (along > 0.8 && along < 10.0 && Math.abs(latN) < 3.0) {
+              const prox = 1 - along / 10.0;
+              if (!launch && (along < 6.5 || closing > 4)) {
+                throttle *= Math.max(0.4, 1 - prox * 0.5);
+                if (along < 4.5 && closing > 2.5) {
+                  brake = Math.max(brake, clamp(0.12 + prox * 0.4, 0, 0.55));
+                }
+              } else if (launch && along < 3.5 && Math.abs(latN) < 1.5) {
+                // Grid exit: gentle lift only if nearly rear-ending
+                throttle *= 0.82;
+              }
+            }
+          }
+          steer = clamp(steer, -1, 1);
+        }
+      }
+
+      let nitro = !corner && spd > 34 && brake < 0.35;
+
       controller.tick(frameDt, {
-        steer, throttle, brake, handbrake, nitro: !corner && spd > 34,
+        steer, throttle, brake, handbrake, nitro,
         assisted: true, abs: true, tcs: true
       });
       return st;
     }
 
-    return { tick, controller, get wp() { return wp; } };
+    return { tick, controller, retargetNear, get wp() { return wp; }, get waypoints() { return waypoints; } };
   }
 
   function defaultOvalWaypoints() {
@@ -4451,6 +4528,443 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
     return results;
   }
 
+
+  // ---------------------------------------------------------------------------
+  // Car-vs-car OBB collision (XZ). Solid contacts, impulse bounce, no tunneling.
+  // Half-extents match visible ~4.7×2.05 m body; restitution ~0.3; Boss heavier.
+  // ---------------------------------------------------------------------------
+  // Sized to visible mesh AABB (player ~2.14×5.89, AI ~2.54×6.05 incl. driver/mirrors) + skin
+  const CAR_HALF_W = 1.22;
+  const CAR_HALF_L = 3.05;
+  const CAR_RESTITUTION = 0.3;
+  const CAR_FRICTION = 0.35;
+  // Scratch — zero per-frame allocs in the hot path
+  const _ax = { x: 0, z: 0 }, _az = { x: 0, z: 0 }, _bx = { x: 0, z: 0 }, _bz = { x: 0, z: 0 };
+  const _cornersA = [{ x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }];
+  const _cornersB = [{ x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }];
+  const _proj = { min: 0, max: 0 };
+
+  function setAxes(yaw, outX, outZ) {
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    // Local +X (right) in world XZ; local +Z (forward) in world XZ
+    // World delta: x += vx*c + vz*s ; z += -vx*s + vz*c  (from physics.js)
+    // So body +X (right) → world (c, -s); body +Z (fwd) → world (s, c)
+    outX.x = c; outX.z = -s;
+    outZ.x = s; outZ.z = c;
+  }
+
+  function fillCorners(x, z, yaw, hw, hl, out) {
+    setAxes(yaw, _ax, _az);
+    const hx = _ax.x * hw, hz = _ax.z * hw;
+    const fx = _az.x * hl, fz = _az.z * hl;
+    out[0].x = x + hx + fx; out[0].z = z + hz + fz;
+    out[1].x = x - hx + fx; out[1].z = z - hz + fz;
+    out[2].x = x - hx - fx; out[2].z = z - hz - fz;
+    out[3].x = x + hx - fx; out[3].z = z + hz - fz;
+  }
+
+  function projectOnto(corners, axisX, axisZ, out) {
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < 4; i++) {
+      const p = corners[i].x * axisX + corners[i].z * axisZ;
+      if (p < min) min = p;
+      if (p > max) max = p;
+    }
+    out.min = min; out.max = max;
+  }
+
+  /**
+   * SAT overlap for two OBBs in XZ. Returns penetration depth (>0 if overlapping)
+   * and writes unit normal (from A toward B) into outN {x,z}. Contact mid into outC.
+   * Returns 0 if separated.
+   */
+  function obbPenetration(ax, az, ayaw, ahw, ahl, bx, bz, byaw, bhw, bhl, outN, outC) {
+    fillCorners(ax, az, ayaw, ahw, ahl, _cornersA);
+    fillCorners(bx, bz, byaw, bhw, bhl, _cornersB);
+    setAxes(ayaw, _ax, _az);
+    setAxes(byaw, _bx, _bz);
+    const axes = [_ax, _az, _bx, _bz];
+    let minPen = Infinity;
+    let nx = 1, nz = 0;
+    for (let i = 0; i < 4; i++) {
+      const axis = axes[i];
+      let len = Math.hypot(axis.x, axis.z);
+      if (len < 1e-8) continue;
+      const ux = axis.x / len, uz = axis.z / len;
+      projectOnto(_cornersA, ux, uz, _proj);
+      const aMin = _proj.min, aMax = _proj.max;
+      projectOnto(_cornersB, ux, uz, _proj);
+      const bMin = _proj.min, bMax = _proj.max;
+      const overlap = Math.min(aMax, bMax) - Math.max(aMin, bMin);
+      if (overlap <= 0) return 0;
+      if (overlap < minPen) {
+        minPen = overlap;
+        // Normal points from A to B along this axis
+        const acx = (ax + bx) * 0.5; // unused; use center delta
+        const dx = bx - ax, dz = bz - az;
+        let sign = (dx * ux + dz * uz) >= 0 ? 1 : -1;
+        nx = ux * sign;
+        nz = uz * sign;
+      }
+    }
+    if (!(minPen < Infinity) || minPen <= 0) return 0;
+    // Deep overlaps: SAT MTV can be sideways (shallowest exit) even for head-ons.
+    // Prefer center-delta normal when deeply interpenetrating so crashes bounce along the hit.
+    const cdx = bx - ax, cdz = bz - az;
+    const cLen = Math.hypot(cdx, cdz);
+    if (minPen > 0.55 && cLen > 1e-6) {
+      nx = cdx / cLen;
+      nz = cdz / cLen;
+    } else {
+      const nlen = Math.hypot(nx, nz) || 1;
+      nx /= nlen; nz /= nlen;
+      // Keep normal pointing A → B
+      if (cdx * nx + cdz * nz < 0) { nx = -nx; nz = -nz; }
+    }
+    outN.x = nx;
+    outN.z = nz;
+    outC.x = (ax + bx) * 0.5;
+    outC.z = (az + bz) * 0.5;
+    return minPen;
+  }
+
+  /** World velocity of a body-frame car state → {wx, wz}. */
+  function worldVel(st) {
+    const c = Math.cos(st.yaw), s = Math.sin(st.yaw);
+    return {
+      wx: st.vx * c + st.vz * s,
+      wz: -st.vx * s + st.vz * c
+    };
+  }
+
+  function setWorldVel(st, wx, wz) {
+    const c = Math.cos(st.yaw), s = Math.sin(st.yaw);
+    st.vx = wx * c - wz * s;
+    st.vz = wx * s + wz * c;
+    st.speed = Math.hypot(st.vx, st.vz);
+  }
+
+  /**
+   * Resolve one pair. Bodies:
+   *  { st, mass, halfW, halfL, kinematic, mesh?, isBoss?, tag? }
+   * kinematic (remote): position may be nudged on mesh only; no velocity write to st if frozen.
+   * Returns impact info or null: { impulse, nx, nz, cx, cz, pen, spinA, spinB }
+   */
+  function resolveCarPair(A, B, opts) {
+    opts = opts || {};
+    const rest = opts.restitution != null ? opts.restitution : CAR_RESTITUTION;
+    const stA = A.st, stB = B.st;
+    if (!stA || !stB) return null;
+    const hwA = A.halfW != null ? A.halfW : CAR_HALF_W;
+    const hlA = A.halfL != null ? A.halfL : CAR_HALF_L;
+    const hwB = B.halfW != null ? B.halfW : CAR_HALF_W;
+    const hlB = B.halfL != null ? B.halfL : CAR_HALF_L;
+
+    const outN = { x: 0, z: 0 }, outC = { x: 0, z: 0 };
+    let pen = obbPenetration(stA.x, stA.z, stA.yaw, hwA, hlA, stB.x, stB.z, stB.yaw, hwB, hlB, outN, outC);
+
+    // Swept / CCD: if currently separated but paths crossed this frame, find contact
+    if (pen <= 0 && A.prevX != null && B.prevX != null) {
+      const relSpd = Math.hypot(
+        (stA.x - A.prevX) - (stB.x - B.prevX),
+        (stA.z - A.prevZ) - (stB.z - B.prevZ)
+      );
+      if (relSpd > 0.28) {
+        const steps = Math.min(16, Math.max(3, Math.ceil(relSpd / 0.18)));
+        for (let s = 1; s <= steps; s++) {
+          const t = s / steps;
+          const ax = A.prevX + (stA.x - A.prevX) * t;
+          const az = A.prevZ + (stA.z - A.prevZ) * t;
+          const bx = B.prevX + (stB.x - B.prevX) * t;
+          const bz = B.prevZ + (stB.z - B.prevZ) * t;
+          const p = obbPenetration(ax, az, stA.yaw, hwA, hlA, bx, bz, stB.yaw, hwB, hlB, outN, outC);
+          if (p > 0) {
+            // Rewind both to first contact sample then resolve from there
+            stA.x = ax; stA.z = az;
+            stB.x = bx; stB.z = bz;
+            pen = p;
+            break;
+          }
+        }
+      }
+    }
+    if (pen <= 0) return null;
+
+    // Cap insane penetration (spawn overlap) — still separate but soft impulse
+    const soft = pen > 1.2;
+    const massA = Math.max(200, A.mass || 1480);
+    const massB = Math.max(200, B.mass || 1480);
+    const kinA = !!A.kinematic;
+    const kinB = !!B.kinematic;
+    // Kinematic (network remotes): immovable for impulse; mesh still nudged below.
+    // allowVel opt-in if a kinematic body should receive velocity (unused online).
+    let invA = (kinA && !A.allowVel) ? 0 : 1 / massA;
+    let invB = (kinB && !B.allowVel) ? 0 : 1 / massB;
+    // Both kinematic (remote-remote visual): allow equal positional split
+    if (kinA && kinB) { invA = 1 / massA; invB = 1 / massB; }
+    // Local vs remote: give remote a ghost mass so local does not eat 100% of the bounce
+    // (peer is another player). Position nudge on remote mesh still applies.
+    if (kinA && !kinB) invA = 1 / (massA * 1.15);
+    if (kinB && !kinA) invB = 1 / (massB * 1.15);
+    const invSum = invA + invB;
+    if (invSum < 1e-12) return null;
+
+    // Positional correction — pull fully out (multi-pass cleans rest)
+    const slop = opts.hardSeparate ? 0 : 0.004;
+    const percent = opts.hardSeparate ? 1.0 : 1.0;
+    const corrMag = Math.max(0, pen - slop) * percent;
+    const corrA = corrMag * (invA / invSum);
+    const corrB = corrMag * (invB / invSum);
+    const nx = outN.x, nz = outN.z;
+    // Push A opposite normal (normal is A→B), B along normal
+    if (!kinA || A.allowNudge) {
+      stA.x -= nx * corrA;
+      stA.z -= nz * corrA;
+    }
+    if (!kinB || B.allowNudge) {
+      stB.x += nx * corrB;
+      stB.z += nz * corrB;
+    }
+    // Visual-only nudge for kinematic remotes (mesh)
+    if (kinA && A.mesh && A.mesh.position) {
+      A.mesh.position.x -= nx * corrA;
+      A.mesh.position.z -= nz * corrA;
+      A._visualNudgeX = (A._visualNudgeX || 0) - nx * corrA;
+      A._visualNudgeZ = (A._visualNudgeZ || 0) - nz * corrA;
+    }
+    if (kinB && B.mesh && B.mesh.position) {
+      B.mesh.position.x += nx * corrB;
+      B.mesh.position.z += nz * corrB;
+      B._visualNudgeX = (B._visualNudgeX || 0) + nx * corrB;
+      B._visualNudgeZ = (B._visualNudgeZ || 0) + nz * corrB;
+    }
+
+    // Relative velocity at centers (good enough; add yaw later for spin)
+    const vA = worldVel(stA);
+    const vB = worldVel(stB);
+    let rvx = vA.wx - vB.wx;
+    let rvz = vA.wz - vB.wz;
+    // With n = A→B: closing when (vA-vB)·n > 0; separating when < 0
+    const velAlongN = rvx * nx + rvz * nz;
+    if (opts.hardSeparate) {
+      // Positional peel only — no extra impulse during residual cleanup
+      return { impulse: 0, nx, nz, cx: outC.x, cz: outC.z, pen, soft: !!soft };
+    }
+    if (velAlongN < -0.05) {
+      // Separating — positional correction alone
+      return { impulse: 0, nx, nz, cx: outC.x, cz: outC.z, pen, soft: !!soft };
+    }
+
+    // Impulse scalar: push A along -n, B along +n (j > 0)
+    const e = soft ? rest * 0.2 : rest;
+    let j = ((1 + e) * Math.max(0, velAlongN)) / invSum;
+    // Clamp huge impulses from tunneling corrections
+    const jMax = soft ? 10 * Math.min(massA, massB) : 32 * Math.min(massA, massB);
+    if (j > jMax) j = jMax;
+
+    const jx = j * nx, jz = j * nz;
+    if (!kinA) {
+      setWorldVel(stA, vA.wx - jx * invA, vA.wz - jz * invA);
+    } else if (A.allowVel) {
+      setWorldVel(stA, vA.wx - jx * invA, vA.wz - jz * invA);
+    }
+    if (!kinB) {
+      setWorldVel(stB, vB.wx + jx * invB, vB.wz + jz * invB);
+    } else if (B.allowVel) {
+      setWorldVel(stB, vB.wx + jx * invB, vB.wz + jz * invB);
+    }
+
+    // Tangential friction (speed loss proportional to impact)
+    const tx = -nz, tz = nx;
+    const vA2 = worldVel(stA), vB2 = worldVel(stB);
+    const rvt = (vA2.wx - vB2.wx) * tx + (vA2.wz - vB2.wz) * tz;
+    let jt = -rvt / invSum;
+    const mu = CAR_FRICTION;
+    const maxF = Math.abs(j) * mu;
+    if (jt > maxF) jt = maxF;
+    if (jt < -maxF) jt = -maxF;
+    if (!kinA) setWorldVel(stA, vA2.wx + tx * jt * invA, vA2.wz + tz * jt * invA);
+    if (!kinB) setWorldVel(stB, vB2.wx - tx * jt * invB, vB2.wz - tz * jt * invB);
+
+    // Yaw spin from off-center hit (contact relative to each CG)
+    const rxA = outC.x - stA.x, rzA = outC.z - stA.z;
+    const rxB = outC.x - stB.x, rzB = outC.z - stB.z;
+    // Force on A is -J, on B is +J; torque τ = rx*Fz - rz*Fx
+    const torqueA = rxA * (-jz) - rzA * (-jx);
+    const torqueB = rxB * jz - rzB * jx;
+    const inertiaA = A.inertiaYaw || (massA * 1.85);
+    const inertiaB = B.inertiaYaw || (massB * 1.85);
+    const spinScale = soft ? 0.15 : 0.55;
+    let spinA = 0, spinB = 0;
+    if (!kinA) {
+      spinA = (torqueA / inertiaA) * spinScale;
+      stA.yawRate = (stA.yawRate || 0) + spinA;
+      // Hard clamp
+      if (stA.yawRate > 3.5) stA.yawRate = 3.5;
+      if (stA.yawRate < -3.5) stA.yawRate = -3.5;
+    }
+    if (!kinB) {
+      spinB = (torqueB / inertiaB) * spinScale;
+      stB.yawRate = (stB.yawRate || 0) + spinB;
+      if (stB.yawRate > 3.5) stB.yawRate = 3.5;
+      if (stB.yawRate < -3.5) stB.yawRate = -3.5;
+    }
+
+    // Extra speed bleed proportional to impact magnitude
+    const impact = Math.abs(j) / Math.min(massA, massB);
+    if (!kinA && impact > 0.5) {
+      stA.vx *= (1 - Math.min(0.35, impact * 0.04));
+      stA.vz *= (1 - Math.min(0.35, impact * 0.04));
+      stA.speed = Math.hypot(stA.vx, stA.vz);
+    }
+    if (!kinB && impact > 0.5) {
+      stB.vx *= (1 - Math.min(0.35, impact * 0.04));
+      stB.vz *= (1 - Math.min(0.35, impact * 0.04));
+      stB.speed = Math.hypot(stB.vx, stB.vz);
+    }
+
+    return {
+      impulse: Math.abs(j),
+      impact,
+      nx, nz,
+      cx: outC.x, cz: outC.z,
+      pen,
+      soft: !!soft,
+      spinA, spinB
+    };
+  }
+
+  /**
+   * Multi-pass resolve for a list of bodies. Returns { maxPen, impacts[] }.
+   * opts.passes default 4; opts.skip if true skips (countdown).
+   */
+  function resolveAllCarPairs(bodies, opts) {
+    opts = opts || {};
+    const out = { maxPen: 0, maxPenSeen: 0, impacts: [] };
+    if (!bodies || bodies.length < 2 || opts.skip) return out;
+    let passes = opts.passes != null ? opts.passes : 6;
+    // Pack / high-dt: extra passes keep multi-body residual under slop
+    if (bodies.length >= 3) passes = Math.max(passes, 8);
+    if (opts.dt != null && opts.dt > 1 / 45) passes = Math.max(passes, 10);
+    const n = bodies.length;
+    for (let pass = 0; pass < passes; pass++) {
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const A = bodies[i], B = bodies[j];
+          // Broadphase circle
+          const dx = A.st.x - B.st.x, dz = A.st.z - B.st.z;
+          const rad = (A.halfL || CAR_HALF_L) + (B.halfL || CAR_HALF_L) + 0.35;
+          if (dx * dx + dz * dz > rad * rad) continue;
+          const hit = resolveCarPair(A, B, opts);
+          if (hit) {
+            if (hit.pen > out.maxPenSeen) out.maxPenSeen = hit.pen;
+            if (pass === 0 && hit.impulse > 50) out.impacts.push(hit);
+          }
+        }
+      }
+    }
+    // Residual penetration AFTER corrections (QA asserts this ≤ ~5 cm)
+    out.maxPen = measureMaxPenetration(bodies);
+    // Hard cleanup: multi-body stacks can leave >slop residual — peel with zero-slop passes
+    if (out.maxPen > 0.015) {
+      const hardOpts = Object.assign({}, opts, { hardSeparate: true });
+      for (let pass = 0; pass < 10; pass++) {
+        for (let i = 0; i < n; i++) {
+          for (let j = i + 1; j < n; j++) {
+            const A = bodies[i], B = bodies[j];
+            const dx = A.st.x - B.st.x, dz = A.st.z - B.st.z;
+            const rad = (A.halfL || CAR_HALF_L) + (B.halfL || CAR_HALF_L) + 0.35;
+            if (dx * dx + dz * dz > rad * rad) continue;
+            resolveCarPair(A, B, hardOpts);
+          }
+        }
+        out.maxPen = measureMaxPenetration(bodies);
+        if (out.maxPen <= 0.012) break;
+      }
+      // Jacobi center-delta peel if SAT MTV still leaves a stack
+      if (out.maxPen > 0.012) {
+        const outN = { x: 0, z: 0 }, outC = { x: 0, z: 0 };
+        for (let pass = 0; pass < 8; pass++) {
+          for (let i = 0; i < n; i++) {
+            for (let j = i + 1; j < n; j++) {
+              const A = bodies[i], B = bodies[j];
+              const hwA = A.halfW || CAR_HALF_W, hlA = A.halfL || CAR_HALF_L;
+              const hwB = B.halfW || CAR_HALF_W, hlB = B.halfL || CAR_HALF_L;
+              const p = obbPenetration(A.st.x, A.st.z, A.st.yaw, hwA, hlA, B.st.x, B.st.z, B.st.yaw, hwB, hlB, outN, outC);
+              if (p <= 0.004) continue;
+              let nx = outN.x, nz = outN.z;
+              const cdx = B.st.x - A.st.x, cdz = B.st.z - A.st.z;
+              const cLen = Math.hypot(cdx, cdz);
+              if (cLen > 1e-6 && p > 0.08) { nx = cdx / cLen; nz = cdz / cLen; }
+              const push = (p - 0.002) * 0.55; // split
+              if (!A.kinematic || A.allowNudge) { A.st.x -= nx * push; A.st.z -= nz * push; }
+              if (!B.kinematic || B.allowNudge) { B.st.x += nx * push; B.st.z += nz * push; }
+            }
+          }
+          out.maxPen = measureMaxPenetration(bodies);
+          if (out.maxPen <= 0.01) break;
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Measure max OBB penetration across pairs (for QA). */
+  function measureMaxPenetration(bodies) {
+    let maxPen = 0;
+    if (!bodies || bodies.length < 2) return 0;
+    const outN = { x: 0, z: 0 }, outC = { x: 0, z: 0 };
+    for (let i = 0; i < bodies.length; i++) {
+      for (let j = i + 1; j < bodies.length; j++) {
+        const A = bodies[i], B = bodies[j];
+        const p = obbPenetration(
+          A.st.x, A.st.z, A.st.yaw, A.halfW || CAR_HALF_W, A.halfL || CAR_HALF_L,
+          B.st.x, B.st.z, B.st.yaw, B.halfW || CAR_HALF_W, B.halfL || CAR_HALF_L,
+          outN, outC
+        );
+        if (p > maxPen) maxPen = p;
+      }
+    }
+    return maxPen;
+  }
+
+  /**
+   * AI unstick: persist timers on body.aiRef (bodies are rebuilt every frame).
+   * Returns true when a shove was applied so caller can re-resolve.
+   */
+  function aiCollisionRecovery(body, hit, dt) {
+    if (!body || !body.st || body.kinematic) return false;
+    const store = body.aiRef || body;
+    if (!hit || hit.pen < 0.015) {
+      store._stuckT = Math.max(0, (store._stuckT || 0) - dt * 2.5);
+      return false;
+    }
+    store._stuckT = (store._stuckT || 0) + dt;
+    // Fast path: deep residual → shove immediately; shallow needs a brief stick time
+    const deep = hit.pen > 0.04;
+    const crawl = (body.st.speed || 0) < 8;
+    const ready = deep || store._stuckT > (crawl ? 0.04 : 0.07);
+    if (!ready) return false;
+    const st = body.st;
+    const push = (deep ? 0.75 : 0.55) + Math.min(1.15, hit.pen * 1.9);
+    st.x -= hit.nx * push;
+    st.z -= hit.nz * push;
+    const v = worldVel(st);
+    setWorldVel(st, v.wx - hit.nx * 13, v.wz - hit.nz * 13);
+    // Nudge forward so they clear the pile instead of oscillating
+    const c = Math.cos(st.yaw), s = Math.sin(st.yaw);
+    const slow = crawl || (st.speed || 0) < 10;
+    st.x += s * (slow ? 1.6 : 1.0); st.z += c * (slow ? 1.6 : 1.0);
+    st.vz = Math.max(st.vz || 0, slow ? 22 : 16);
+    st.vx *= 0.4;
+    st.speed = Math.hypot(st.vx || 0, st.vz || 0);
+    st.yawRate *= 0.08;
+    store._stuckT = 0;
+    store._recoverBoost = slow ? 2.2 : 1.5;
+    store._needRetarget = true;
+    return true;
+  }
+
   global.HrdVehicle = {
     createVehicleController,
     createAiDriver,
@@ -4458,7 +4972,17 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
     gripFromTemp,
     FIXED_DT,
     runHeadlessTests,
-    defaultOvalWaypoints
+    defaultOvalWaypoints,
+    CAR_HALF_W,
+    CAR_HALF_L,
+    CAR_RESTITUTION,
+    obbPenetration,
+    resolveCarPair,
+    resolveAllCarPairs,
+    measureMaxPenetration,
+    aiCollisionRecovery,
+    worldVel,
+    setWorldVel
   };
   // Alias expected by SPEC naming
   global.VehicleController = global.HrdVehicle;
@@ -11171,12 +11695,45 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       engineOsc.start();
       started = true;
     }
+    let muted = false;
+    try { muted = localStorage.getItem('street-racers-mute-v1') === '1'; } catch (_) {}
     return {
       resume() { ensure(); if (ctx.state === 'suspended') ctx.resume(); },
+      setMuted(v) { muted = !!v; if (muted && gain) gain.gain.value = 0; },
+      isMuted() { return muted; },
       update(rpm, throttle, speed) {
-        if (!started) return;
+        if (!started || muted) return;
         engineOsc.frequency.setTargetAtTime(70 + rpm * 0.04, ctx.currentTime, 0.05);
         gain.gain.setTargetAtTime(0.02 + throttle * 0.06 + Math.min(speed, 40) * 0.001, ctx.currentTime, 0.08);
+      },
+      /** Short synthesized crash thud (noise burst through lowpass). */
+      playCrash(intensity) {
+        if (muted) return;
+        try {
+          ensure();
+          if (ctx.state === 'suspended') ctx.resume();
+          const t0 = ctx.currentTime;
+          const amp = Math.max(0.04, Math.min(0.28, 0.05 + (intensity || 0.5) * 0.12));
+          const dur = 0.08 + Math.min(0.14, (intensity || 0.5) * 0.06);
+          const bufferSize = Math.max(1, (ctx.sampleRate * dur) | 0);
+          const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+          const data = buffer.getChannelData(0);
+          for (let i = 0; i < bufferSize; i++) {
+            const env = Math.pow(1 - i / bufferSize, 1.6);
+            data[i] = (Math.random() * 2 - 1) * env;
+          }
+          const src = ctx.createBufferSource();
+          src.buffer = buffer;
+          const filt = ctx.createBiquadFilter();
+          filt.type = 'lowpass';
+          filt.frequency.value = 180 + Math.min(500, (intensity || 0.5) * 400);
+          const g = ctx.createGain();
+          g.gain.setValueAtTime(amp, t0);
+          g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+          src.connect(filt); filt.connect(g); g.connect(ctx.destination);
+          src.start(t0);
+          src.stop(t0 + dur + 0.02);
+        } catch (_) {}
       }
     };
   }
@@ -11391,6 +11948,62 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       emitPair(x, z, yaw) {
         this.emit(x, z, yaw, -1);
         this.emit(x, z, yaw, 1);
+      }
+    };
+  }
+
+  /** Cheap pooled spark / debris particles at crash contact. */
+  function createSparkSystem(scene) {
+    const count = 64;
+    const geo = new THREE.BufferGeometry();
+    const positions = new Float32Array(count * 3);
+    const ages = [];
+    for (let i = 0; i < count; i++) {
+      positions[i * 3] = 0; positions[i * 3 + 1] = -20; positions[i * 3 + 2] = 0;
+      ages.push({ life: 0, max: 0, vx: 0, vy: 0, vz: 0, active: false });
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.PointsMaterial({
+      color: 0xffdd88, size: 0.38, transparent: true, opacity: 1,
+      depthWrite: false, sizeAttenuation: true
+    });
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    points.name = 'CrashSparks';
+    scene.add(points);
+    let cursor = 0;
+    return {
+      emit(x, y, z, n, nx, nz) {
+        n = Math.max(1, Math.min(18, n | 0));
+        const bx = nx || 0, bz = nz || 0;
+        for (let k = 0; k < n; k++) {
+          const a = ages[cursor];
+          a.active = true; a.life = 0; a.max = 0.35 + Math.random() * 0.45;
+          a.vx = bx * (2 + Math.random() * 4) + (Math.random() - 0.5) * 5;
+          a.vy = 1.5 + Math.random() * 4;
+          a.vz = bz * (2 + Math.random() * 4) + (Math.random() - 0.5) * 5;
+          positions[cursor * 3] = x + (Math.random() - 0.5) * 0.25;
+          positions[cursor * 3 + 1] = y + Math.random() * 0.35;
+          positions[cursor * 3 + 2] = z + (Math.random() - 0.5) * 0.25;
+          cursor = (cursor + 1) % count;
+        }
+      },
+      update(dt) {
+        for (let i = 0; i < count; i++) {
+          const a = ages[i];
+          if (!a.active) continue;
+          a.life += dt;
+          if (a.life >= a.max) {
+            a.active = false;
+            positions[i * 3 + 1] = -20;
+            continue;
+          }
+          a.vy -= 12 * dt;
+          positions[i * 3] += a.vx * dt;
+          positions[i * 3 + 1] += a.vy * dt;
+          positions[i * 3 + 2] += a.vz * dt;
+        }
+        geo.attributes.position.needsUpdate = true;
       }
     };
   }
@@ -11745,11 +12358,11 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
 
     /**
      * One shared starting grid for EVERY car (local, remotes, AI, Boss).
-     * 2-wide rows; lat 4.5 / along 9 ≈ ≥1 car-width lateral OR ≥1 car-length along.
+     * 2-wide rows; lat/along leave clear air around OBB 1.22×3.05 so GO is not a jam.
      */
     const GRID_COLS = 2;
-    const GRID_LAT = 4.5;
-    const GRID_ALONG = 9;
+    const GRID_LAT = 6.2;
+    const GRID_ALONG = 11.5;
     function gridOffsetForSlot(slot) {
       const s = Math.max(0, slot | 0);
       const row = (s / GRID_COLS) | 0;
@@ -11844,6 +12457,7 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
             : { engine: 1, turbo: 1, tires: 1, brakes: 1, suspension: 1 };
           aiCtl = HrdVehicle.createVehicleController({
             upgrades: ups,
+            mass: isBoss ? 1780 : 1480,
             raycast: track.raycast,
             walls: trackWalls,
             mapEnv: Object.assign({ ambientC: 20 }, track.mapEnv || {}, {
@@ -11854,12 +12468,29 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
           aiCtl.reset(aiX, aiY, aiZ, aiYaw);
           mesh.position.set(aiX, aiY, aiZ);
           mesh.rotation.y = aiYaw;
+          const laneBias = ((idx % 2) === 0 ? -1.8 : 1.8) + (isBoss ? 0.5 : 0) + (idx % 3) * 0.35;
+          const selfCtl = aiCtl;
           aiDriver = HrdVehicle.createAiDriver(aiCtl, {
             skill: isBoss ? 0.94 : (0.75 + (idx % 3) * 0.08),
-            startWp: idx * 3,
+            // All AI spawn at the start line — offsetting startWp made mid-pack cut the infield
+            startWp: 0,
             // Long circuits: short look-ahead (~3% of WPs, ~25–40 m) so AI does not cut chicanes
             lookAhead: Math.max(2, Math.min(5, Math.round(((trackWaypoints && trackWaypoints.length) || 24) * 0.03))),
-            waypoints: trackWaypoints
+            waypoints: trackWaypoints,
+            laneBias,
+            getNeighbors() {
+              const out = [];
+              if (physics && physics.state) {
+                out.push({ x: physics.state.x, z: physics.state.z, yaw: physics.state.yaw, speed: physics.state.speed || 0 });
+              }
+              for (let k = 0; k < aiCars.length; k++) {
+                const o = aiCars[k];
+                if (!o || !o.ctl || o.ctl === selfCtl || !o.ctl.state) continue;
+                const s = o.ctl.state;
+                out.push({ x: s.x, z: s.z, yaw: s.yaw, speed: s.speed || 0 });
+              }
+              return out;
+            }
           });
         }
         aiCars.push({
@@ -12020,6 +12651,11 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
     const audio = createAudio();
     const smoke = createSmokeSystem(scene);
     const skids = createSkidSystem(scene);
+    const sparks = createSparkSystem(scene);
+    let crashShake = 0;
+    let crashWobble = 0;
+    let lastCrashSoundT = 0;
+    let collDebug = { maxPen: 0, lastImpact: 0, impacts: 0 };
     const nitroFx = createNitroFlames(carMesh, quality);
 
     const polishOn = !!(global.StreetPolish);
@@ -12555,6 +13191,7 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
         let shake = 0;
         if (spdKmh > 120) shake += (spdKmh - 120) * 0.00045;
         if (st.nitro && st.throttle > 0.2) shake += 0.035;
+        if (crashShake > 0) shake += crashShake;
         if (shake > 0 && !window.__captureNoAfterimage) {
           chaseSmooth.pos.x += (Math.random() - 0.5) * shake;
           chaseSmooth.pos.y += (Math.random() - 0.5) * shake * 0.6;
@@ -12595,6 +13232,289 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
         }
       }
       return cam;
+    }
+
+
+    /**
+     * Solid car-vs-car for player, AI (incl. Boss), and online remotes.
+     * Skipped on the starting-grid countdown. Uses OBB SAT + CCD samples.
+     */
+    function resolveCarCollisions(dt) {
+      collDebug.maxPen = 0;
+      if (!(global.HrdVehicle && HrdVehicle.resolveAllCarPairs)) return;
+      // Starting grid: no jolts during countdown
+      if (raceFrozen && !raceLive) return;
+
+      const HW = HrdVehicle.CAR_HALF_W || 1.22;
+      const HL = HrdVehicle.CAR_HALF_L || 3.05;
+      const bodies = [];
+
+      // Local player
+      const pst = physics.state;
+      const localBody = {
+        st: pst,
+        mass: (physics.getMass && physics.getMass()) || physics.mass || 1480,
+        halfW: HW, halfL: HL,
+        kinematic: false,
+        mesh: carMesh,
+        isPlayer: true,
+        prevX: pst._prevX != null ? pst._prevX : pst.x,
+        prevZ: pst._prevZ != null ? pst._prevZ : pst.z
+      };
+      bodies.push(localBody);
+
+      // AI (Boss included)
+      for (let i = 0; i < aiCars.length; i++) {
+        const ai = aiCars[i];
+        if (!ai.ctl || !ai.ctl.state) continue;
+        const st = ai.ctl.state;
+        const mass = (ai.ctl.physics && ai.ctl.physics.getMass && ai.ctl.physics.getMass())
+          || (ai.isBoss ? 1780 : 1480);
+        bodies.push({
+          st,
+          mass,
+          halfW: HW, halfL: HL,
+          kinematic: false,
+          mesh: ai.mesh,
+          isAI: true,
+          isBoss: !!ai.isBoss,
+          aiRef: ai,
+          prevX: st._prevX != null ? st._prevX : st.x,
+          prevZ: st._prevZ != null ? st._prevZ : st.z
+        });
+      }
+
+      // Online remotes — kinematic, mesh-nudged
+      remoteMeshes.forEach((rec, id) => {
+        if (!rec || !rec.mesh) return;
+        const m = rec.mesh;
+        // Decay prior visual nudge toward network pose (avoid permanent offset)
+        if (rec._nudgeX || rec._nudgeZ) {
+          rec._nudgeX *= 0.85;
+          rec._nudgeZ *= 0.85;
+          if (Math.abs(rec._nudgeX) < 0.005) rec._nudgeX = 0;
+          if (Math.abs(rec._nudgeZ) < 0.005) rec._nudgeZ = 0;
+        }
+        const st = rec._collSt || (rec._collSt = { x: 0, y: 0.55, z: 0, yaw: 0, vx: 0, vz: 0, yawRate: 0, speed: 0 });
+        st.x = m.position.x;
+        st.y = m.position.y;
+        st.z = m.position.z;
+        st.yaw = m.rotation.y;
+        st.speed = m.userData.lastSpeed || 0;
+        st.vx = 0; st.vz = st.speed; st.yawRate = 0;
+        bodies.push({
+          st,
+          mass: 1480,
+          halfW: HW, halfL: HL,
+          kinematic: true,
+          allowNudge: true,
+          mesh: m,
+          isRemote: true,
+          rec,
+          prevX: rec._prevX != null ? rec._prevX : st.x,
+          prevZ: rec._prevZ != null ? rec._prevZ : st.z
+        });
+      });
+
+      if (bodies.length < 2) return;
+
+      let result = HrdVehicle.resolveAllCarPairs(bodies, { passes: 6, restitution: 0.3, dt: dt });
+      collDebug.maxPen = result.maxPen || 0;
+
+      // Sync AI / player meshes to resolved physics; remotes keep nudge
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        if (b.isRemote && b.rec && b.mesh) {
+          const dx = b.st.x - (b.mesh.position.x - (b.rec._nudgeX || 0));
+          const dz = b.st.z - (b.mesh.position.z - (b.rec._nudgeZ || 0));
+          // st was seeded from mesh; after resolve st moved — that delta is the nudge
+          // Recompute: original mesh without nudge vs new st
+        }
+        if (b.isRemote && b.mesh) {
+          // apply resolved st directly (includes nudge)
+          b.mesh.position.x = b.st.x;
+          b.mesh.position.z = b.st.z;
+          if (b.rec) {
+            b.rec._nudgeX = (b.rec._nudgeX || 0) + (b._visualNudgeX || 0);
+            b.rec._nudgeZ = (b.rec._nudgeZ || 0) + (b._visualNudgeZ || 0);
+            b.rec._prevX = b.st.x;
+            b.rec._prevZ = b.st.z;
+          }
+        } else if (b.mesh && b.st) {
+          b.mesh.position.x = b.st.x;
+          b.mesh.position.z = b.st.z;
+          b.mesh.rotation.y = b.st.yaw;
+          if (b.aiRef && b.aiRef.ctl && b.aiRef.ctl.resyncRenderPose) b.aiRef.ctl.resyncRenderPose();
+        }
+        if (b.st) {
+          b.st._prevX = b.st.x;
+          b.st._prevZ = b.st.z;
+        }
+        if (b.isAI && b.aiRef && result.impacts && result.impacts.length) {
+          // Find an impact involving this body via penetration leftover
+          const pen = HrdVehicle.measureMaxPenetration
+            ? 0 : 0;
+        }
+      }
+
+      // AI recovery if still deep in a pile (timers live on aiRef — bodies are ephemeral)
+      let didRecover = false;
+      if (HrdVehicle.aiCollisionRecovery) {
+        for (let i = 0; i < bodies.length; i++) {
+          const b = bodies[i];
+          if (!b.isAI || !b.aiRef) continue;
+          let worst = null;
+          for (let j = 0; j < bodies.length; j++) {
+            if (i === j) continue;
+            const o = bodies[j];
+            const outN = { x: 0, z: 0 }, outC = { x: 0, z: 0 };
+            const p = HrdVehicle.obbPenetration(
+              b.st.x, b.st.z, b.st.yaw, HW, HL,
+              o.st.x, o.st.z, o.st.yaw, HW, HL,
+              outN, outC
+            );
+            if (p > 0.015 && (!worst || p > worst.pen)) worst = { pen: p, nx: outN.x, nz: outN.z };
+          }
+          if (worst) {
+            if (HrdVehicle.aiCollisionRecovery(b, worst, dt)) didRecover = true;
+          } else {
+            HrdVehicle.aiCollisionRecovery(b, null, dt);
+          }
+          const store = b.aiRef;
+          if (store._needRetarget && store.ai && store.ai.retargetNear) {
+            store.ai.retargetNear();
+            store._needRetarget = false;
+          }
+          if (store._recoverBoost > 0 && b.st) {
+            b.st.vz = Math.max(b.st.vz, 16);
+            if ((b.st.speed || 0) < 12) b.st.vz = Math.max(b.st.vz, 20);
+            store._recoverBoost -= dt;
+          }
+          // Progress anti-stuck: crawl OR waypoint stall (orbit near grid) → launch along track
+          if (b.st) {
+            const spd = b.st.speed || 0;
+            if (spd < 5.5) store._slowT = (store._slowT || 0) + dt;
+            else store._slowT = Math.max(0, (store._slowT || 0) - dt * 1.8);
+
+            let wpNow = -1;
+            try { wpNow = (store.ai && store.ai.wp != null) ? store.ai.wp : -1; } catch (_) {}
+            if (wpNow !== (store._lastWp|0)) {
+              store._lastWp = wpNow;
+              store._wpStallT = 0;
+              store._wpAnchorX = b.st.x;
+              store._wpAnchorZ = b.st.z;
+            } else {
+              store._wpStallT = (store._wpStallT || 0) + dt;
+            }
+            // Euclidean travel since last wp advance — catches high-speed orbits
+            const ax = store._wpAnchorX != null ? store._wpAnchorX : b.st.x;
+            const az = store._wpAnchorZ != null ? store._wpAnchorZ : b.st.z;
+            const traveled = Math.hypot(b.st.x - ax, b.st.z - az);
+            const stall = (store._wpStallT || 0) > 1.15 && traveled < 14;
+            const crawlStuck = (store._slowT || 0) > 0.7;
+
+            if (crawlStuck || stall) {
+              if (store.ai && store.ai.retargetNear) store.ai.retargetNear();
+              // Aim along track ribbon if waypoints available
+              let yaw = b.st.yaw || 0;
+              const wps = store.ai && store.ai.waypoints;
+              const wi = store.ai && store.ai.wp;
+              if (wps && wps.length && wi != null) {
+                const a = wps[wi % wps.length];
+                const bb = wps[(wi + 1) % wps.length];
+                yaw = Math.atan2(bb.x - a.x, bb.z - a.z);
+                b.st.yaw = yaw;
+              }
+              const s = Math.sin(yaw), c = Math.cos(yaw);
+              // Lateral peel from nearest other body so re-launch does not re-stack
+              let lx = 0, lz = 0, bestD = 1e9;
+              for (let j = 0; j < bodies.length; j++) {
+                if (j === i || !bodies[j].st) continue;
+                const dx = b.st.x - bodies[j].st.x, dz = b.st.z - bodies[j].st.z;
+                const d = Math.hypot(dx, dz);
+                if (d > 0.05 && d < bestD && d < 8) { bestD = d; lx = dx / d; lz = dz / d; }
+              }
+              b.st.x += s * 3.2 + lx * 1.8;
+              b.st.z += c * 3.2 + lz * 1.8;
+              b.st.vz = Math.max(b.st.vz || 0, 24);
+              b.st.vx *= 0.25;
+              b.st.speed = Math.hypot(b.st.vx || 0, b.st.vz || 0);
+              b.st.yawRate *= 0.1;
+              store._slowT = 0;
+              store._wpStallT = 0;
+              store._wpAnchorX = b.st.x;
+              store._wpAnchorZ = b.st.z;
+              store._recoverBoost = Math.max(store._recoverBoost || 0, 2.0);
+              didRecover = true;
+            }
+          }
+        }
+      }
+      // Recovery shove can create a new contact — peel again so maxPen stays honest
+      if (didRecover) {
+        result = HrdVehicle.resolveAllCarPairs(bodies, { passes: 8, restitution: 0.25, dt: dt, hardSeparate: true });
+        collDebug.maxPen = result.maxPen || 0;
+        for (let i = 0; i < bodies.length; i++) {
+          const b = bodies[i];
+          if (b.isRemote && b.mesh) {
+            b.mesh.position.x = b.st.x;
+            b.mesh.position.z = b.st.z;
+          } else if (b.mesh && b.st) {
+            b.mesh.position.x = b.st.x;
+            b.mesh.position.z = b.st.z;
+            b.mesh.rotation.y = b.st.yaw;
+            if (b.aiRef && b.aiRef.ctl && b.aiRef.ctl.resyncRenderPose) b.aiRef.ctl.resyncRenderPose();
+          }
+        }
+      }
+
+      // Effects from strongest new impact
+      if (result.impacts && result.impacts.length) {
+        let best = result.impacts[0];
+        for (let i = 1; i < result.impacts.length; i++) {
+          if (result.impacts[i].impulse > best.impulse) best = result.impacts[i];
+        }
+        const intensity = Math.min(1.5, best.impulse / 4000);
+        collDebug.lastImpact = intensity;
+        collDebug.impacts += 1;
+        if (intensity > 0.12) {
+          crashShake = Math.max(crashShake, 0.04 + intensity * 0.22);
+          crashWobble = Math.max(crashWobble, 0.12 + intensity * 0.35);
+          sparks.emit(best.cx, 0.55, best.cz, 10 + (intensity * 16) | 0, best.nx, best.nz);
+          const nowT = performance.now();
+          if (nowT - lastCrashSoundT > 90) {
+            lastCrashSoundT = nowT;
+            try { audio.playCrash(intensity); } catch (_) {}
+          }
+        }
+      }
+
+      // Keep local render pose in sync if controller interpolates
+      if (vehicleCtl && vehicleCtl.state) {
+        // Force curr pose snap so getRenderPose does not re-lerp into overlap
+        try {
+          const rp = vehicleCtl.getRenderPose && vehicleCtl.getRenderPose();
+          // Directly sync mesh already done; also patch internal poses if accessible
+          if (vehicleCtl.physics && vehicleCtl.physics.state) {
+            // state already mutated in place
+          }
+        } catch (_) {}
+      }
+    }
+
+    function stashCarPrevPositions() {
+      const pst = physics.state;
+      pst._prevX = pst.x; pst._prevZ = pst.z;
+      for (let i = 0; i < aiCars.length; i++) {
+        const st = aiCars[i].ctl && aiCars[i].ctl.state;
+        if (st) { st._prevX = st.x; st._prevZ = st.z; }
+      }
+      remoteMeshes.forEach((rec) => {
+        if (rec && rec.mesh) {
+          rec._prevX = rec.mesh.position.x;
+          rec._prevZ = rec.mesh.position.z;
+        }
+      });
     }
 
     function updateAI(dt) {
@@ -12799,6 +13719,7 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
         tcs: assists.tcs,
         assisted: assists.assisted
       };
+      stashCarPrevPositions();
       if (vehicleCtl) {
         if (vehicleCtl.getRespawnPhase()) {
           vehicleCtl.updateRespawn(dt, hud.respawnFade);
@@ -12871,6 +13792,21 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       if (minimap) minimap.draw(st.x, st.z);
       updateAI(dt);
       updateOnline(dt, st, now);
+      resolveCarCollisions(dt);
+      if (vehicleCtl && vehicleCtl.resyncRenderPose) vehicleCtl.resyncRenderPose();
+      // Re-sync local mesh after collision push (authoritative state)
+      carMesh.position.set(st.x, st.y, st.z);
+      carMesh.rotation.y = st.yaw;
+      sparks.update(dt);
+      if (crashShake > 0) crashShake = Math.max(0, crashShake - dt * 1.8);
+      if (crashWobble > 0) {
+        crashWobble = Math.max(0, crashWobble - dt * 2.4);
+        const ch = carMesh.userData && carMesh.userData.chassis;
+        if (ch) {
+          ch.rotation.z += Math.sin(performance.now() * 0.055) * crashWobble * 0.045;
+          ch.rotation.x += Math.cos(performance.now() * 0.07) * crashWobble * 0.03;
+        }
+      }
 
       if (raceLive && !localFinished) raceClock += dt;
 
@@ -12964,6 +13900,7 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
         handbrake: inp.handbrake, nitro: inp.nitro,
         abs: assists.abs, tcs: assists.tcs, assisted: assists.assisted
       };
+      stashCarPrevPositions();
       if (vehicleCtl) {
         if (vehicleCtl.getRespawnPhase()) vehicleCtl.updateRespawn(dt, hud.respawnFade);
         vehicleCtl.tick(dt, driveInp);
@@ -13007,6 +13944,20 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       if (minimap) minimap.draw(st.x, st.z);
       updateAI(dt);
       updateOnline(dt, st, performance.now());
+      resolveCarCollisions(dt);
+      if (vehicleCtl && vehicleCtl.resyncRenderPose) vehicleCtl.resyncRenderPose();
+      carMesh.position.set(st.x, st.y, st.z);
+      carMesh.rotation.y = st.yaw;
+      sparks.update(dt);
+      if (crashShake > 0) crashShake = Math.max(0, crashShake - dt * 1.8);
+      if (crashWobble > 0) {
+        crashWobble = Math.max(0, crashWobble - dt * 2.4);
+        const ch = carMesh.userData && carMesh.userData.chassis;
+        if (ch) {
+          ch.rotation.z += Math.sin(performance.now() * 0.055) * crashWobble * 0.045;
+          ch.rotation.x += Math.cos(performance.now() * 0.07) * crashWobble * 0.03;
+        }
+      }
       if (raceLive && !localFinished) raceClock += dt;
 
       if (styleScorer && !localFinished) {
@@ -13255,6 +14206,72 @@ var solanaWeb3=function(exports){"use strict";function getDefaultExportFromCjs(x
       getPhysics() { return physics; },
       getAiCars() { return aiCars; },
       getController() { return vehicleCtl; },
+      getCollisionDebug() { return { maxPen: collDebug.maxPen, lastImpact: collDebug.lastImpact, impacts: collDebug.impacts, shake: crashShake, wobble: crashWobble }; },
+      /** QA: force an immediate car-car resolve pass and return max penetration. */
+      qaResolveCollisions(dt) {
+        resolveCarCollisions(dt == null ? 1/60 : dt);
+        return collDebug.maxPen;
+      },
+      getRemoteMeshes() { return remoteMeshes; },
+      getAudio() { return audio; },
+      /** QA: teleport local + first AI into a scripted impact setup. */
+      qaSetupCrash(kind) {
+        const pst = physics.state;
+        const ai = aiCars[0];
+        if (!ai || !ai.ctl) return null;
+        const ast = ai.ctl.state;
+        const base = { x: pst.x, z: pst.z, yaw: pst.yaw };
+        // Place both near current player pose, relative along forward/right
+        const c = Math.cos(base.yaw), s = Math.sin(base.yaw);
+        function place(st, along, right, vzBody, vxBody) {
+          st.x = base.x + s * along + c * right;
+          st.z = base.z + c * along - s * right;
+          st.y = 0.55;
+          st.yaw = base.yaw;
+          st.yawRate = 0;
+          st.vx = vxBody || 0;
+          st.vz = vzBody || 0;
+          st.speed = Math.hypot(st.vx, st.vz);
+          st.gear = 3; st.rpm = 4000;
+        }
+        if (kind === 'rear') {
+          place(pst, 0, 0, 38, 0);
+          place(ast, 6.4, 0, 6, 0);
+        } else if (kind === 'head') {
+          place(pst, 0, 0, 28, 0);
+          place(ast, 6.8, 0, -28, 0);
+          ast.yaw = base.yaw + Math.PI;
+          // Facing each other: flip body vz into their local forward
+          ast.vz = 28;
+        } else if (kind === 'side') {
+          place(pst, 0, 0, 26, 3);
+          place(ast, 2.0, 2.35, 22, -2);
+        } else {
+          place(pst, 0, 0, 30, 0);
+          place(ast, 6.4, 0.3, 8, 0);
+        }
+        if (vehicleCtl && vehicleCtl.resyncRenderPose) vehicleCtl.resyncRenderPose();
+        if (ai.ctl.resyncRenderPose) ai.ctl.resyncRenderPose();
+        carMesh.position.set(pst.x, pst.y, pst.z); carMesh.rotation.y = pst.yaw;
+        ai.mesh.position.set(ast.x, ast.y, ast.z); ai.mesh.rotation.y = ast.yaw;
+        stashCarPrevPositions();
+        return { player: { x: pst.x, z: pst.z, vz: pst.vz }, ai: { x: ast.x, z: ast.z, vz: ast.vz } };
+      },
+      qaMeasurePen() {
+        if (!(global.HrdVehicle && HrdVehicle.measureMaxPenetration)) return 0;
+        const HW = HrdVehicle.CAR_HALF_W, HL = HrdVehicle.CAR_HALF_L;
+        const bodies = [{ st: physics.state, halfW: HW, halfL: HL }];
+        for (let i = 0; i < aiCars.length; i++) {
+          if (aiCars[i].ctl) bodies.push({ st: aiCars[i].ctl.state, halfW: HW, halfL: HL });
+        }
+        remoteMeshes.forEach((rec) => {
+          if (!rec || !rec.mesh) return;
+          const st = rec._collSt || { x: rec.mesh.position.x, z: rec.mesh.position.z, yaw: rec.mesh.rotation.y };
+          st.x = rec.mesh.position.x; st.z = rec.mesh.position.z; st.yaw = rec.mesh.rotation.y;
+          bodies.push({ st, halfW: HW, halfL: HL });
+        });
+        return HrdVehicle.measureMaxPenetration(bodies);
+      },
       triggerRespawn(cp) {
         if (!vehicleCtl) return null;
         return vehicleCtl.respawnPlayer(cp || vehicleCtl.getLastSafeCheckpoint() || track.start, hud.respawnFade);

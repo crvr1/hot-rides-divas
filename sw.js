@@ -7,7 +7,7 @@
  * Connections: registered from index.html / shell-m2.js; precaches APP_SHELL.
  */
 /* eslint-disable no-restricted-globals */
-const CACHE = 'hrd-m2-v3-preview1';
+const CACHE = 'hrd-m2-v3-final1';
 const APP_SHELL = [
   './',
   './index.html',
