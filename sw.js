@@ -7,15 +7,35 @@
  * Connections: registered from index.html / shell-m2.js; precaches APP_SHELL.
  */
 /* eslint-disable no-restricted-globals */
-const CACHE = 'hrd-m2-v3-final1';
+const CACHE = 'hrd-full-final';
 const APP_SHELL = [
-  './',
-  './index.html',
-  './manifest.json',
-  './icon-192.png',
-  './icon-512.png',
-  './en.json',
-  './es.json'
+  "./",
+  "./index.html",
+  "./manifest.json",
+  "./icon-192.png",
+  "./icon-512.png",
+  "./en.json",
+  "./es.json",
+  "./garage-bina-hero.webp",
+  "./garage-bitty-hero.webp",
+  "./garage-boss-hero.webp",
+  "./garage-ethy-hero.webp",
+  "./garage-face-bina.webp",
+  "./garage-face-bitty.webp",
+  "./garage-face-boss.webp",
+  "./garage-face-ethy.webp",
+  "./garage-face-litty.webp",
+  "./garage-face-lmao.webp",
+  "./garage-face-momo.webp",
+  "./garage-face-neon.webp",
+  "./garage-litty-hero.webp",
+  "./garage-lmao-hero.webp",
+  "./garage-momo-hero.webp",
+  "./garage-neon-hero.webp",
+  "./garage-street-night.webp",
+  "./garage-tile-drivers.webp",
+  "./garage-tile-garage.webp",
+  "./garage-tile-shop.webp"
 ];
 
 self.addEventListener('install', (event) => {
