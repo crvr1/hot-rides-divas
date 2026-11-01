@@ -7,7 +7,7 @@
  * Connections: registered from index.html / shell-m2.js; precaches APP_SHELL.
  */
 /* eslint-disable no-restricted-globals */
-const CACHE = 'hrd-full-final';
+const CACHE = 'hrd-full-final3';
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -35,7 +35,9 @@ const APP_SHELL = [
   "./garage-street-night.webp",
   "./garage-tile-drivers.webp",
   "./garage-tile-garage.webp",
-  "./garage-tile-shop.webp"
+  "./garage-tile-shop.webp",
+  "./loading-art.webp",
+  "./intro-start.webp"
 ];
 
 self.addEventListener('install', (event) => {
